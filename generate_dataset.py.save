@@ -1,0 +1,77 @@
+import csv
+import random
+
+products = [
+    "iphone 15",
+    "airpods pro",
+    "robot vacuum",
+    "gaming laptop",
+    "coffee machine",
+    "running shoes",
+    "protein powder",
+    "office chair",
+    "wireless headphones",
+    "electric bike"
+]
+
+brands = [
+    "facebook",
+    "paypal",
+    "amazon",
+    "netflix",
+    "spotify",
+    "instagram",
+    "linkedin",
+    "twitter"
+]
+
+tasks = [
+    "cook rice",
+    "lose weight",
+    "build muscle",
+    "start a business",
+    "learn python",
+    "change a tire",
+    "edit videos",
+    "invest in stocks"
+]
+
+cities = [
+    "amsterdam",
+    "rotterdam",
+    "utrecht",
+    "eindhoven",
+    "arnhem"
+]
+
+rows = []
+
+nd([f"{p} price", "transactional"])
+    rows.append([f"{p} discount", "transactional"])
+
+# Commercial
+for p in products:
+    rows.append([f"best {p}", "commercial"])
+    rows.append([f"{p} review", "commercial"])
+    rows.append([f"{p} vs competitors", "commercial"s.append([f"what is {t}", "informational"])
+
+# Navigational
+for b in brands:
+    rows.append([f"{b} login", "navigational"])
+    rows.append([f"{b} customer service", "navigational"])
+
+# Local
+for p in products:
+    for c in cities:
+        rows.append([f"{p} in {c}", "local"])
+
+# Shuffle
+random.shuffle(rows)
+
+# Save CSV
+with open("dataset.csv", "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["query", "intent"])
+    writer.writerows(rows)
+
+print(f"Generated {len(rows)} labeled queries.")

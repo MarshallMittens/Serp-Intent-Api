@@ -1,0 +1,29 @@
+{
+  "admin_key": "CHANGE-ME-ADMIN-KEY",
+  "keys": {
+    "WeNnzG-r0GLTdMSFYyN8ABIjmKpak-89K2jVyqrAh_s": {
+      "name": "string",
+      "daily_limit": 200,
+      "usage_date": "2026-02-27",
+      "usage_count": 0
+    },
+    "gBFqC616k_PtnsBohCeTDzDN-vJuQWBAXvzBDpNVlEs": {
+      "name": "string",
+      "daily_limit": 200,
+      "usage_date": "2026-02-27",
+      "usage_count": 0
+    },
+    "pCWQuFuzv-CTC-IQ7HtMGDQjzKVAHdbYhliFy-qEMmg": {
+      "name": "string",
+      "daily_limit": 200,
+      "usage_date": "2026-02-27",
+      "usage_count": 101
+    },
+    "3CRJO7VAjKSjvPRIXFDtUirMsPC_XXlzQdyAg8MPHvk": {
+      "name": "string",
+      "daily_limit": 200,
+      "usage_date": "2026-02-28",
+      "usage_count": 5
+    }
+  }
+}
