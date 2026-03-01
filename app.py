@@ -5,6 +5,7 @@ import os
 import joblib
 import json
 import secrets
+import httpx
 from datetime import date
 
 app = FastAPI(title="SERP Intent Classification API", version="1.2.0")
@@ -86,6 +87,42 @@ ml_model = None
 if os.path.exists(MODEL_PATH):
     ml_model = joblib.load(MODEL_PATH)
 
+    DATAFORSEO_LOGIN = os.getenv("DATAFORSEO_LOGIN", "")
+DATAFORSEO_PASSWORD = os.getenv("DATAFORSEO_PASSWORD", "")
+DATAFORSEO_BASE_URL = "https://api.dataforseo.com/v3"
+
+
+def require_dataforseo_credentials():
+    if not DATAFORSEO_LOGIN or not DATAFORSEO_PASSWORD:
+        raise HTTPException(status_code=500, detail="DataForSEO credentials not configured")
+
+
+async def fetch_dataforseo_search_volume_live(
+    keywords: List[str],
+    location_code: int,
+    language_code: str,
+) -> dict:
+    """
+    Calls:
+    POST https://api.dataforseo.com/v3/keywords_data/google_ads/search_volume/live
+    Provides search volume, CPC, competition, etc. for up to 1000 keywords/request.
+    """
+    require_dataforseo_credentials()
+
+    url = f"{DATAFORSEO_BASE_URL}/keywords_data/google_ads/search_volume/live"
+    payload = [{
+        "keywords": keywords,
+        "location_code": location_code,
+        "language_code": language_code
+    }]
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(url, json=payload, auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD))
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"DataForSEO error: {r.status_code} {r.text}")
+
+        return r.json()
+
 # -----------------------------
 # Pydantic models
 # -----------------------------
@@ -113,7 +150,32 @@ class BatchIntentRequest(BaseModel):
     queries: List[str]
     serp_features: Optional[List[str]] = None
 
+class KeywordAnalyzeRequest(BaseModel):
+    keywords: List[str] = Field(..., min_items=1, max_items=1000)
+    location_code: int = Field(..., description="DataForSEO location_code, e.g. 2528 for Netherlands")
+    language_code: str = Field(default="nl", description="DataForSEO language_code, e.g. 'nl' or 'en'")
+    serp_features: Optional[List[str]] = None  # optional global SERP signals if you want to influence your ML
 
+
+class KeywordAnalyzeItem(BaseModel):
+    keyword: str
+    intent: str
+    confidence: float
+    buying_stage: str
+    conversion_score: float
+    recommended_content: str
+    priority_score: int
+    priority_reason: str
+    # External metrics
+    search_volume: Optional[int] = None
+    cpc: Optional[float] = None
+    competition: Optional[float] = None
+
+
+class KeywordAnalyzeResponse(BaseModel):
+    items: List[KeywordAnalyzeItem]
+    count: int
+    
 class UsageResponse(BaseModel):
     name: str
     daily_limit: int
@@ -349,5 +411,70 @@ def batch_intent(req: BatchIntentRequest, x_api_key: str = Header(default="")):
             "recommended_content": recommended_content,
             "reasons": reasons
         })
+
+        @app.post("/v1/keyword/analyze", response_model=KeywordAnalyzeResponse)
+async def keyword_analyze(req: KeywordAnalyzeRequest, x_api_key: str = Header(default="")):
+    require_api_key(x_api_key)
+
+    # 1) Fetch external metrics from DataForSEO
+    dfs = await fetch_dataforseo_search_volume_live(
+        keywords=req.keywords,
+        location_code=req.location_code,
+        language_code=req.language_code,
+    )
+
+    # 2) Build a lookup from DataForSEO response
+    # DataForSEO returns tasks -> result -> items (structure may include nested arrays)
+    # We'll parse defensively.
+    keyword_metrics = {}
+    tasks = (dfs or {}).get("tasks", [])
+    for t in tasks:
+        results = t.get("result", []) or []
+        for res in results:
+            items = res.get("items", []) or []
+            for it in items:
+                kw = it.get("keyword")
+                if not kw:
+                    continue
+                keyword_metrics[kw.lower()] = {
+                    "search_volume": it.get("search_volume"),
+                    "cpc": it.get("cpc"),
+                    "competition": it.get("competition"),
+                }
+
+    # 3) Enrich with your decision engine
+    out_items: List[KeywordAnalyzeItem] = []
+    for kw in req.keywords:
+        serp_features = req.serp_features or []
+
+        ml_result = predict_with_ml(kw, serp_features)
+        if ml_result:
+            label, confidence, reasons = ml_result
+            if confidence < 0.55:
+                rule_label, rule_conf, rule_reasons = classify_intent(kw, serp_features)
+                label = rule_label
+                confidence = max(rule_conf, confidence)
+        else:
+            label, confidence, _ = classify_intent(kw, serp_features)
+
+        buying_stage, conversion_score, recommended_content = enrich_decision_data(label, serp_features)
+        priority_score, priority_reason = compute_priority_score(kw, label, conversion_score, serp_features)
+
+        m = keyword_metrics.get(kw.lower(), {})
+        out_items.append(KeywordAnalyzeItem(
+            keyword=kw,
+            intent=label,
+            confidence=confidence,
+            buying_stage=buying_stage,
+            conversion_score=conversion_score,
+            recommended_content=recommended_content,
+            priority_score=priority_score,
+            priority_reason=priority_reason,
+            search_volume=m.get("search_volume"),
+            cpc=m.get("cpc"),
+            competition=m.get("competition"),
+        ))
+
+    return KeywordAnalyzeResponse(items=out_items, count=len(out_items))
 
     return {"results": results, "count": len(results)}
