@@ -1,18 +1,18 @@
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 import os
-import joblib
 import json
 import secrets
+import joblib
 import httpx
 from datetime import date
 
-app = FastAPI(title="SERP Intent Classification API", version="1.2.0")
+app = FastAPI(title="SERP Intent Classification API", version="1.3.0")
 
-# -----------------------------
-# Key store (JSON-based)
-# -----------------------------
+# ============================================================
+# 1) Key store (JSON-based)
+# ============================================================
 KEYS_FILE = os.getenv("KEYS_FILE", "keys.json")
 
 
@@ -26,7 +26,6 @@ def load_key_store() -> dict:
         store = {"admin_key": "CHANGE-ME-ADMIN-KEY", "keys": {}}
         save_key_store(store)
         return store
-
     with open(KEYS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -51,7 +50,7 @@ def increment_usage_or_block(api_key: str) -> None:
         rec["usage_count"] = 0
 
     limit = int(rec.get("daily_limit", 100))
-    if rec.get("usage_count", 0) >= limit:
+    if int(rec.get("usage_count", 0)) >= limit:
         raise HTTPException(status_code=429, detail="Rate limit exceeded (daily limit)")
 
     rec["usage_count"] = int(rec.get("usage_count", 0)) + 1
@@ -79,15 +78,18 @@ def require_api_key(x_api_key: str):
     increment_usage_or_block(x_api_key)
 
 
-# -----------------------------
-# ML model loading
-# -----------------------------
+# ============================================================
+# 2) ML model loading
+# ============================================================
 MODEL_PATH = os.getenv("MODEL_PATH", "intent_model.joblib")
 ml_model = None
 if os.path.exists(MODEL_PATH):
     ml_model = joblib.load(MODEL_PATH)
 
-    DATAFORSEO_LOGIN = os.getenv("DATAFORSEO_LOGIN", "")
+# ============================================================
+# 3) DataForSEO config
+# ============================================================
+DATAFORSEO_LOGIN = os.getenv("DATAFORSEO_LOGIN", "")
 DATAFORSEO_PASSWORD = os.getenv("DATAFORSEO_PASSWORD", "")
 DATAFORSEO_BASE_URL = "https://api.dataforseo.com/v3"
 
@@ -103,9 +105,7 @@ async def fetch_dataforseo_search_volume_live(
     language_code: str,
 ) -> dict:
     """
-    Calls:
-    POST https://api.dataforseo.com/v3/keywords_data/google_ads/search_volume/live
-    Provides search volume, CPC, competition, etc. for up to 1000 keywords/request.
+    POST /v3/keywords_data/google_ads/search_volume/live
     """
     require_dataforseo_credentials()
 
@@ -120,12 +120,12 @@ async def fetch_dataforseo_search_volume_live(
         r = await client.post(url, json=payload, auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD))
         if r.status_code >= 400:
             raise HTTPException(status_code=502, detail=f"DataForSEO error: {r.status_code} {r.text}")
-
         return r.json()
 
-# -----------------------------
-# Pydantic models
-# -----------------------------
+
+# ============================================================
+# 4) Pydantic models
+# ============================================================
 class CreateKeyRequest(BaseModel):
     name: str = Field(..., min_length=1)
     daily_limit: int = Field(default=60, ge=1, le=100000)
@@ -142,19 +142,29 @@ class IntentResponse(BaseModel):
     buying_stage: str
     conversion_score: float
     recommended_content: str
+    priority_score: int
+    priority_reason: str
     reasons: List[str]
 
 
 class BatchIntentRequest(BaseModel):
-    # Removed min_items for max compatibility across Pydantic versions
     queries: List[str]
     serp_features: Optional[List[str]] = None
+
+
+class UsageResponse(BaseModel):
+    name: str
+    daily_limit: int
+    usage_date: str
+    usage_count: int
+    remaining_today: int
+
 
 class KeywordAnalyzeRequest(BaseModel):
     keywords: List[str] = Field(..., min_items=1, max_items=1000)
     location_code: int = Field(..., description="DataForSEO location_code, e.g. 2528 for Netherlands")
     language_code: str = Field(default="nl", description="DataForSEO language_code, e.g. 'nl' or 'en'")
-    serp_features: Optional[List[str]] = None  # optional global SERP signals if you want to influence your ML
+    serp_features: Optional[List[str]] = None
 
 
 class KeywordAnalyzeItem(BaseModel):
@@ -166,7 +176,6 @@ class KeywordAnalyzeItem(BaseModel):
     recommended_content: str
     priority_score: int
     priority_reason: str
-    # External metrics
     search_volume: Optional[int] = None
     cpc: Optional[float] = None
     competition: Optional[float] = None
@@ -175,18 +184,11 @@ class KeywordAnalyzeItem(BaseModel):
 class KeywordAnalyzeResponse(BaseModel):
     items: List[KeywordAnalyzeItem]
     count: int
-    
-class UsageResponse(BaseModel):
-    name: str
-    daily_limit: int
-    usage_date: str
-    usage_count: int
-    remaining_today: int
 
 
-# -----------------------------
-# Intent rules + enrichment
-# -----------------------------
+# ============================================================
+# 5) Rules + Enrichment + ML helper
+# ============================================================
 TRANSACTIONAL = {
     "buy", "order", "deal", "discount", "coupon", "price", "pricing",
     "kopen", "bestellen", "aanbieding", "korting", "prijs", "prijzen"
@@ -246,6 +248,62 @@ def enrich_decision_data(intent: str, serp_features: Optional[List[str]]):
     return buying_stage, score, recommended_content
 
 
+def compute_priority_score(
+    query: str,
+    intent: str,
+    conversion_score: float,
+    serp_features: Optional[List[str]]
+) -> tuple[int, str]:
+    q = (query or "").lower()
+    features = set([f.lower() for f in (serp_features or [])])
+
+    score = int(round(conversion_score * 80))
+    reasons = []
+
+    intent_boost = {
+        "transactional": 12,
+        "navigational": 8,
+        "local": 8,
+        "commercial": 5,
+        "informational": 0
+    }
+    score += intent_boost.get(intent, 0)
+    reasons.append(f"intent={intent}")
+
+    if "shopping_ads" in features:
+        score += 6
+        reasons.append("shopping_ads")
+    if "product_listings" in features:
+        score += 6
+        reasons.append("product_listings")
+    if "local_pack" in features:
+        score += 4
+        reasons.append("local_pack")
+    if "featured_snippet" in features:
+        score -= 4
+        reasons.append("featured_snippet")
+    if "people_also_ask" in features:
+        score -= 3
+        reasons.append("people_also_ask")
+
+    money_mods = [
+        "buy", "order", "pricing", "price", "discount", "deal", "coupon", "cheap",
+        "kopen", "bestellen", "prijs", "prijzen", "korting", "aanbieding", "goedkoop"
+    ]
+    if any(m in q for m in money_mods):
+        score += 6
+        reasons.append("money_modifier")
+
+    compare_mods = ["best", "review", "reviews", "compare", "comparison", "vs", "top", "beste", "vergelijk", "vergelijking"]
+    if any(m in q for m in compare_mods):
+        score += 3
+        reasons.append("comparison_modifier")
+
+    score = max(0, min(score, 100))
+    short_reason = ", ".join(reasons[:4]) if reasons else "baseline"
+    return score, short_reason
+
+
 def classify_intent(query: str, serp_features: Optional[List[str]]) -> Tuple[str, float, List[str]]:
     q = query.lower().strip()
     features = set([f.lower() for f in (serp_features or [])])
@@ -295,7 +353,6 @@ def predict_with_ml(query: str, serp_features: Optional[List[str]] = None):
         return None
 
     text = query.strip() + " " + features_to_tokens_list(serp_features)
-
     label = ml_model.predict([text])[0]
     proba = ml_model.predict_proba([text])[0]
     classes = list(ml_model.classes_)
@@ -304,9 +361,9 @@ def predict_with_ml(query: str, serp_features: Optional[List[str]] = None):
     return label, confidence, reasons
 
 
-# -----------------------------
-# Endpoints
-# -----------------------------
+# ============================================================
+# 6) Endpoints
+# ============================================================
 @app.post("/admin/create_key")
 def admin_create_key(req: CreateKeyRequest, x_admin_key: str = Header(default="")):
     store = load_key_store()
@@ -355,7 +412,6 @@ def intent(req: IntentRequest, x_api_key: str = Header(default="")):
 
     if ml_result:
         label, confidence, reasons = ml_result
-
         if confidence < 0.55:
             rule_label, rule_conf, rule_reasons = classify_intent(req.query, req.serp_features)
             label = rule_label
@@ -365,6 +421,7 @@ def intent(req: IntentRequest, x_api_key: str = Header(default="")):
         label, confidence, reasons = classify_intent(req.query, req.serp_features)
 
     buying_stage, conversion_score, recommended_content = enrich_decision_data(label, req.serp_features)
+    priority_score, priority_reason = compute_priority_score(req.query, label, conversion_score, req.serp_features)
 
     return IntentResponse(
         intent=label,
@@ -372,6 +429,8 @@ def intent(req: IntentRequest, x_api_key: str = Header(default="")):
         buying_stage=buying_stage,
         conversion_score=conversion_score,
         recommended_content=recommended_content,
+        priority_score=priority_score,
+        priority_reason=priority_reason,
         reasons=reasons
     )
 
@@ -381,7 +440,6 @@ def batch_intent(req: BatchIntentRequest, x_api_key: str = Header(default="")):
     require_api_key(x_api_key)
 
     results = []
-
     for q in req.queries:
         q = (q or "").strip()
         if not q:
@@ -391,7 +449,6 @@ def batch_intent(req: BatchIntentRequest, x_api_key: str = Header(default="")):
 
         if ml_result:
             label, confidence, reasons = ml_result
-
             if confidence < 0.55:
                 rule_label, rule_conf, rule_reasons = classify_intent(q, req.serp_features)
                 label = rule_label
@@ -401,6 +458,7 @@ def batch_intent(req: BatchIntentRequest, x_api_key: str = Header(default="")):
             label, confidence, reasons = classify_intent(q, req.serp_features)
 
         buying_stage, conversion_score, recommended_content = enrich_decision_data(label, req.serp_features)
+        priority_score, priority_reason = compute_priority_score(q, label, conversion_score, req.serp_features)
 
         results.append({
             "query": q,
@@ -409,10 +467,15 @@ def batch_intent(req: BatchIntentRequest, x_api_key: str = Header(default="")):
             "buying_stage": buying_stage,
             "conversion_score": conversion_score,
             "recommended_content": recommended_content,
+            "priority_score": priority_score,
+            "priority_reason": priority_reason,
             "reasons": reasons
         })
 
-        @app.post("/v1/keyword/analyze", response_model=KeywordAnalyzeResponse)
+    return {"results": results, "count": len(results)}
+
+
+@app.post("/v1/keyword/analyze", response_model=KeywordAnalyzeResponse)
 async def keyword_analyze(req: KeywordAnalyzeRequest, x_api_key: str = Header(default="")):
     require_api_key(x_api_key)
 
@@ -423,11 +486,9 @@ async def keyword_analyze(req: KeywordAnalyzeRequest, x_api_key: str = Header(de
         language_code=req.language_code,
     )
 
-    # 2) Build a lookup from DataForSEO response
-    # DataForSEO returns tasks -> result -> items (structure may include nested arrays)
-    # We'll parse defensively.
-    keyword_metrics = {}
-    tasks = (dfs or {}).get("tasks", [])
+    # 2) Build lookup (defensive parse)
+    keyword_metrics: Dict[str, Dict[str, Any]] = {}
+    tasks = (dfs or {}).get("tasks", []) or []
     for t in tasks:
         results = t.get("result", []) or []
         for res in results:
@@ -442,8 +503,9 @@ async def keyword_analyze(req: KeywordAnalyzeRequest, x_api_key: str = Header(de
                     "competition": it.get("competition"),
                 }
 
-    # 3) Enrich with your decision engine
+    # 3) Enrich using your decision engine
     out_items: List[KeywordAnalyzeItem] = []
+
     for kw in req.keywords:
         serp_features = req.serp_features or []
 
@@ -476,5 +538,3 @@ async def keyword_analyze(req: KeywordAnalyzeRequest, x_api_key: str = Header(de
         ))
 
     return KeywordAnalyzeResponse(items=out_items, count=len(out_items))
-
-    return {"results": results, "count": len(results)}
